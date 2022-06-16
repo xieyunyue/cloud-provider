@@ -97,6 +97,14 @@ type Controller struct {
 	// nodeQueue is serviced by only one go-routine, so node events are not
 	// processed concurrently.
 	lastSyncedNodes []*v1.Node
+
+	endpointLister       corelisters.EndpointsLister
+	endpointListerSynced cache.InformerSynced
+	// endpoints that need to be synced
+	endpointsQueue workqueue.RateLimitingInterface
+
+	// if service controller will create lb svc in directPodIP mode or nodePort mode
+	directPodIP bool
 }
 
 // New returns a new service controller to keep cloud provider service resources
@@ -106,25 +114,31 @@ func New(
 	kubeClient clientset.Interface,
 	serviceInformer coreinformers.ServiceInformer,
 	nodeInformer coreinformers.NodeInformer,
+	endpointInformer coreinformers.EndpointsInformer,
 	clusterName string,
 	featureGate featuregate.FeatureGate,
+	directPodIP bool,
 ) (*Controller, error) {
 	broadcaster := record.NewBroadcaster()
 	recorder := broadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "service-controller"})
 
 	registerMetrics()
 	s := &Controller{
-		cloud:            cloud,
-		kubeClient:       kubeClient,
-		clusterName:      clusterName,
-		cache:            &serviceCache{serviceMap: make(map[string]*cachedService)},
-		eventBroadcaster: broadcaster,
-		eventRecorder:    recorder,
-		nodeLister:       nodeInformer.Lister(),
-		nodeListerSynced: nodeInformer.Informer().HasSynced,
-		serviceQueue:     workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(minRetryDelay, maxRetryDelay), "service"),
-		nodeQueue:        workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(minRetryDelay, maxRetryDelay), "node"),
-		lastSyncedNodes:  []*v1.Node{},
+		cloud:                cloud,
+		kubeClient:           kubeClient,
+		clusterName:          clusterName,
+		cache:                &serviceCache{serviceMap: make(map[string]*cachedService)},
+		eventBroadcaster:     broadcaster,
+		eventRecorder:        recorder,
+		nodeLister:           nodeInformer.Lister(),
+		nodeListerSynced:     nodeInformer.Informer().HasSynced,
+		serviceQueue:         workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(minRetryDelay, maxRetryDelay), "service"),
+		nodeQueue:            workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(minRetryDelay, maxRetryDelay), "node"),
+		lastSyncedNodes:      []*v1.Node{},
+		endpointLister:       endpointInformer.Lister(),
+		endpointListerSynced: endpointInformer.Informer().HasSynced,
+		endpointsQueue:       workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(minRetryDelay, maxRetryDelay), "endpoint"),
+		directPodIP:          directPodIP,
 	}
 
 	serviceInformer.Informer().AddEventHandlerWithResyncPeriod(
@@ -151,6 +165,10 @@ func New(
 	)
 	s.serviceLister = serviceInformer.Lister()
 	s.serviceListerSynced = serviceInformer.Informer().HasSynced
+
+	endpointInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		UpdateFunc: s.updateEndpoint,
+	})
 
 	nodeInformer.Informer().AddEventHandlerWithResyncPeriod(
 		cache.ResourceEventHandlerFuncs{
@@ -180,7 +198,6 @@ func New(
 		},
 		nodeSyncPeriod,
 	)
-
 	if err := s.init(); err != nil {
 		return nil, err
 	}
@@ -220,6 +237,7 @@ func (c *Controller) enqueueNode(obj interface{}) {
 // object.
 func (c *Controller) Run(ctx context.Context, workers int, controllerManagerMetrics *controllersmetrics.ControllerManagerMetrics) {
 	defer runtime.HandleCrash()
+
 	defer c.serviceQueue.ShutDown()
 	defer c.nodeQueue.ShutDown()
 
@@ -227,6 +245,7 @@ func (c *Controller) Run(ctx context.Context, workers int, controllerManagerMetr
 	c.eventBroadcaster.StartStructuredLogging(0)
 	c.eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: c.kubeClient.CoreV1().Events("")})
 	defer c.eventBroadcaster.Shutdown()
+	defer c.endpointsQueue.ShutDown()
 
 	klog.Info("Starting service controller")
 	defer klog.Info("Shutting down service controller")
@@ -239,11 +258,17 @@ func (c *Controller) Run(ctx context.Context, workers int, controllerManagerMetr
 
 	for i := 0; i < workers; i++ {
 		go wait.UntilWithContext(ctx, c.serviceWorker, time.Second)
+		if c.directPodIP {
+			go wait.UntilWithContext(ctx, c.endpointWorker, time.Second)
+		}
 	}
 
-	// Initialize one go-routine servicing node events. This ensure we only
-	// process one node at any given moment in time
-	go wait.UntilWithContext(ctx, func(ctx context.Context) { c.nodeWorker(ctx, workers) }, time.Second)
+	// sync node only if LB svc in nodePort mode
+	if !c.directPodIP {
+		// Initialize one go-routine servicing node events. This ensure we only
+		// process one node at any given moment in time
+		go wait.UntilWithContext(ctx, func(ctx context.Context) { c.nodeWorker(ctx, workers) }, time.Second)
+	}
 
 	<-ctx.Done()
 }
@@ -275,6 +300,50 @@ func (c *Controller) processNextNodeItem(ctx context.Context, workers int) bool 
 
 	c.nodeQueue.Forget(key)
 	return true
+}
+
+// endpointWorker runs a worker thread that just dequeues items, processes them, and marks them done.
+// It enforces that the syncHandler is never invoked concurrently with the same key.
+func (c *Controller) endpointWorker(ctx context.Context) {
+	for c.processNextEndpointWorkItem(ctx) {
+	}
+}
+
+func (c *Controller) processNextEndpointWorkItem(ctx context.Context) bool {
+	key, quit := c.endpointsQueue.Get()
+	if quit {
+		return false
+	}
+	defer c.endpointsQueue.Done(key)
+
+	err := c.updateService(ctx, key.(string))
+	if err == nil {
+		c.endpointsQueue.Forget(key)
+		return true
+	}
+
+	runtime.HandleError(fmt.Errorf("error updating endpoints for service %v (will retry): %v", key, err))
+	c.endpointsQueue.AddRateLimited(key)
+	return true
+}
+
+// updateService will call updateLoadBalancer to update pool members
+func (c *Controller) updateService(ctx context.Context, key string) error {
+
+	namespace, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		return err
+	}
+	service, err := c.serviceLister.Services(namespace).Get(name)
+	if err != nil {
+		klog.Errorf("Failed to get service %s with error %v", name, err)
+		return err
+	}
+	klog.Infof("Update service %s/%s which in direct-pod-ip mode triggered by endpoints changed ", namespace, name)
+	var emptyNodes []*v1.Node
+	err = c.balancer.UpdateLoadBalancer(ctx, c.clusterName, service, emptyNodes)
+
+	return err
 }
 
 func (c *Controller) processNextServiceItem(ctx context.Context) bool {
@@ -604,6 +673,47 @@ func (c *Controller) needsUpdate(oldService *v1.Service, newService *v1.Service)
 	return false
 }
 
+// updateEndpoint
+func (c *Controller) updateEndpoint(old, new interface{}) {
+	oldep := old.(*v1.Endpoints)
+	newep := new.(*v1.Endpoints)
+
+	// service of the endpoint
+	name := newep.Name
+	namespace := newep.Namespace
+
+	service, err := c.serviceLister.Services(namespace).Get(name)
+
+	if apierrors.IsNotFound(err) {
+		// for some endpoints without service that used for leader election, such as endpoints in kubevirt namespace
+		// the resourceVersion keep increasing and endpoints keep updating
+		klog.V(4).Infof("Failed to get service %s with error %v, do not need update service", name, err)
+		return
+	} else if err != nil {
+		klog.Errorf("Failed to get service %s with error %v", name, err)
+		return
+	}
+
+	if service.Spec.Type == v1.ServiceTypeLoadBalancer {
+		if c.directPodIP {
+			if !reflect.DeepEqual(oldep.Subsets, newep.Subsets) {
+				klog.Infof("Endpoint %s changed, update the service in direct-pod-ip mode", name)
+				c.enqueueEndpoint(new)
+			}
+		}
+	}
+}
+
+// obj could be an *v1.Endpoints, or a DeletionFinalStateUnknown marker item.
+func (c *Controller) enqueueEndpoint(obj interface{}) {
+	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+	if err != nil {
+		runtime.HandleError(fmt.Errorf("couldn't get key for object %#v: %v", obj, err))
+		return
+	}
+	c.endpointsQueue.Add(key)
+}
+
 func getPortsForLB(service *v1.Service) []*v1.ServicePort {
 	ports := []*v1.ServicePort{}
 	for i := range service.Spec.Ports {
@@ -738,6 +848,10 @@ func (c *Controller) nodeSyncService(svc *v1.Service, oldNodes, newNodes []*v1.N
 
 	if nodesSufficientlyEqual(oldNodes, newNodes) {
 		return retSuccess
+	}
+	if c.directPodIP {
+		klog.Infof("service %s/%s is direct-pod-ip mode, skip sync nodes", svc.Namespace, svc.Name)
+		return false
 	}
 
 	klog.V(4).Infof("nodeSyncService started for service %s/%s", svc.Namespace, svc.Name)

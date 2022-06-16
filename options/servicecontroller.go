@@ -33,6 +33,7 @@ func (o *ServiceControllerOptions) AddFlags(fs *pflag.FlagSet) {
 	}
 
 	fs.Int32Var(&o.ConcurrentServiceSyncs, "concurrent-service-syncs", o.ConcurrentServiceSyncs, "The number of services that are allowed to sync concurrently. Larger number = more responsive service management, but more CPU (and network) load")
+	fs.BoolVar(&o.DirectPodIP, "direct-pod-ip",true, "If 'true' configured, load balancer will use pods ip addresses as pool members instead of nodes addresses.")
 }
 
 // ApplyTo fills up ServiceController config with options.
@@ -42,6 +43,7 @@ func (o *ServiceControllerOptions) ApplyTo(cfg *serviceconfig.ServiceControllerC
 	}
 
 	cfg.ConcurrentServiceSyncs = o.ConcurrentServiceSyncs
+	cfg.DirectPodIP = o.DirectPodIP
 
 	return nil
 }
