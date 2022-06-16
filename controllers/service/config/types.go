@@ -22,4 +22,9 @@ type ServiceControllerConfiguration struct {
 	// allowed to sync concurrently. Larger number = more responsive service
 	// management, but more CPU (and network) load.
 	ConcurrentServiceSyncs int32
+
+	// directPodIp is the mode of load balancer service
+	// If true configured, load balancer will use pods ip addresses
+	// as pool members instead of nodes addresses.
+	DirectPodIP bool
 }
