@@ -85,8 +85,10 @@ func startServiceController(ctx context.Context, initContext ControllerInitConte
 		completedConfig.ClientBuilder.ClientOrDie(initContext.ClientName),
 		completedConfig.SharedInformers.Core().V1().Services(),
 		completedConfig.SharedInformers.Core().V1().Nodes(),
+		completedConfig.SharedInformers.Core().V1().Endpoints(),
 		completedConfig.ComponentConfig.KubeCloudShared.ClusterName,
 		utilfeature.DefaultFeatureGate,
+		completedConfig.ComponentConfig.ServiceController.DirectPodIP,
 	)
 	if err != nil {
 		// This error shouldn't fail. It lives like this as a legacy.
